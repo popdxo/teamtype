@@ -53,7 +53,7 @@ pub struct PlatformListener {
     #[deref]
     listener: NamedPipeServer,
     #[cfg(windows)]
-    listener_path: PathBuf,
+    pipe_name: String,
 }
 
 impl PlatformListener {
@@ -75,36 +75,44 @@ impl PlatformListener {
         Ok(Self { listener })
     }
 
+    /// Named pipes live in one machine-wide namespace (`\\.\pipe\`), not in the project
+    /// directory, so each daemon gets a pipe name of its own (several can run at once, one per
+    /// project) and writes it into the listener file, where `teamtype client` reads it.
     #[cfg(windows)]
-    fn new(_parent_path: &Path, listener_path: &Path) -> Result<Self> {
-        let pipe_name = format!(
-            r"\\.\pipe\{}",
-            listener_path
-                .to_str()
-                .context("Failed to parse listener path")?
-                .split('\\')
-                .next_back()
-                .context("Failed to format a name for named pipes")?
-        );
+    fn new(parent_path: &Path, listener_path: &Path) -> Result<Self> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let pipe_name = format!(r"\\.\pipe\teamtype-{}-{nanos}", std::process::id());
+        let listener = Self::create_instance(&pipe_name, true)?;
+        sandbox::write_file(parent_path, listener_path, pipe_name.as_bytes())
+            .with_context(|| format!("Unable to write the pipe's name to {}", listener_path.display()))?;
+        debug!("Listening for connections on named pipe: {pipe_name}");
+        Ok(Self { listener, pipe_name })
+    }
+
+    /// One instance of the pipe (each serves one connection). `first`: the pipe must not exist
+    /// yet, so nobody else can have made it before us.
+    #[cfg(windows)]
+    fn create_instance(pipe_name: &str, first: bool) -> Result<NamedPipeServer> {
         let mut server_options = ServerOptions::new();
         server_options.pipe_mode(PipeMode::Byte);
+        server_options.first_pipe_instance(first);
         // Only allow local connections.
         server_options.reject_remote_clients(true);
         // TODO: Consider options to only allow current user to connect => custom security_descriptor => server_options.create_with_security_attributes_raw()
         // c.f. https://github.com/teamtype/teamtype/issues/654
-        let listener = server_options
-            .create(&pipe_name)
-            .with_context(|| format!("Unable to create named pipe: {pipe_name}"))?;
-        debug!("Listening for connections on named pipe: {pipe_name}");
-        Ok(Self {
-            listener,
-            listener_path: listener_path.to_path_buf(),
-        })
+        server_options
+            .create(pipe_name)
+            .with_context(|| format!("Unable to create named pipe: {pipe_name}"))
     }
 
     #[cfg(windows)]
     fn respawn(&self) -> Result<Self> {
-        Self::new(Path::new(""), &self.listener_path)
+        Ok(Self {
+            listener: Self::create_instance(&self.pipe_name, false)?,
+            pipe_name: self.pipe_name.clone(),
+        })
     }
 }
 
@@ -164,11 +172,16 @@ pub async fn spawn_listener(listener_path: &Path, ui: &UserInterface) -> Result<
     {
         // If there's an existing listener, try to connect to it as a client. If that fails, we assume
         // there's no other daemon running and we can delete the listener.
-        let existing_listener = strip_current_dir(listener_path);
         #[cfg(unix)]
-        let connection = UnixStream::connect(existing_listener).await;
+        let connection = UnixStream::connect(strip_current_dir(listener_path)).await;
         #[cfg(windows)]
-        let connection = ClientOptions::new().open(existing_listener);
+        let connection = sandbox::read_file(parent_path, listener_path)
+            .ok()
+            .and_then(|name| String::from_utf8(name).ok())
+            .map_or_else(
+                || Err(std::io::Error::other("no pipe name in the listener file")),
+                |name| ClientOptions::new().open(name.trim()),
+            );
         if connection.is_ok() {
             bail!(
                 "Detected an existing daemon running for this directory. Rejecting to start another one."

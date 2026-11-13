@@ -121,21 +121,15 @@ impl RPCForwarder<ReadHalf<NamedPipeClient>, WriteHalf<NamedPipeClient>> for JSO
         FramedWrite<WriteHalf<NamedPipeClient>, LinesCodec>,
     )> {
         let listener_path = directory.join(CONFIG_DIR).join(LISTENER_NAME);
-        // Convert the Path to a UTF-8 string and prepend the named pipe prefix.
-        let pipe_name = format!(
-            r"\\.\pipe\{}",
-            listener_path
-                .to_str()
-                .context("Failed to parse listener path")?
-                .split('\\')
-                .next_back()
-                .context("Failed to format a name for named pipes")?
-        );
+        // The daemon writes its pipe's name into the listener file (see editor.rs).
+        let pipe_name = std::fs::read_to_string(&listener_path)
+            .with_context(|| format!("No daemon found ({} is missing)", listener_path.display()))?;
+        let pipe_name = pipe_name.trim();
         // TODO: Check if there are security options we could set here => client_options.open_with_security_attributes_raw().
         // c.f. https://github.com/teamtype/teamtype/issues/654
         let mut client_options = ClientOptions::new();
         client_options.pipe_mode(PipeMode::Byte);
-        let client = client_options.open(&pipe_name)?;
+        let client = client_options.open(pipe_name)?;
         let (read_half, write_half) = io::split(client);
         let reader = FramedRead::new(read_half, LinesCodec::new());
         let writer = FramedWrite::new(write_half, LinesCodec::new());
