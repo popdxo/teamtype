@@ -123,7 +123,14 @@ impl RelativePath {
             bail!("project_dir was equal to path when computing relative path");
         }
 
-        Ok(Self(relative_path.to_path_buf()))
+        // Always with forward slashes: relative paths go between computers (cursors, the names of
+        // the files), and on macOS and Linux a Windows backslash is part of a file's name. Windows
+        // takes either.
+        let portable: Vec<String> = relative_path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        Ok(Self(PathBuf::from(portable.join("/"))))
     }
 
     pub fn try_from_path(project_dir: &Path, path: &Path) -> Result<Self, anyhow::Error> {
@@ -174,6 +181,16 @@ impl TryFrom<String> for FileUri {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn relative_paths_use_forward_slashes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("file"), "").unwrap();
+        let path = AbsolutePath::try_from(dir.path().join("sub").join("file")).unwrap();
+        let relative = RelativePath::try_from_absolute(dir.path(), &path).unwrap();
+        assert_eq!(serde_json::to_string(&relative).unwrap(), "\"sub/file\"");
+    }
 
     #[test]
     fn test_file_path_for_uri_fails_not_absolute() {
